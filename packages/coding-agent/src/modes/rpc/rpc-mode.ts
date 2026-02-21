@@ -19,12 +19,20 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
+import { SessionManager } from "../../core/session-manager.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
+import { parseRpcInputLine } from "./rpc-command-validation.js";
+import { resolveListSessionsTarget, toRpcNavigateTreeResult, toRpcSessionListItem } from "./rpc-command-wiring.js";
+import { settleFireAndForgetStart } from "./rpc-fire-and-forget.js";
+import { deleteSessionByPath, renameSessionByPath } from "./rpc-session-mutation.js";
+import { buildToolCallMap, projectTree } from "./rpc-tree-projection.js";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcForkMessage,
 	RpcResponse,
+	RpcSessionListItem,
 	RpcSessionState,
 	RpcSlashCommand,
 } from "./rpc-types.js";
@@ -35,8 +43,23 @@ export type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcResponse,
+	RpcSessionListItem,
 	RpcSessionState,
+	RpcTreeNode,
 } from "./rpc-types.js";
+
+type RpcSetEditorTextRequest = Extract<RpcExtensionUIRequest, { method: "setEditorText" }>;
+type RpcLegacySetEditorTextRequest = Extract<RpcExtensionUIRequest, { method: "set_editor_text" }>;
+
+/**
+ * Create extension UI requests for setEditorText with both preferred and legacy method names.
+ */
+export function createSetEditorTextRequests(text: string): [RpcSetEditorTextRequest, RpcLegacySetEditorTextRequest] {
+	return [
+		{ type: "extension_ui_request", id: crypto.randomUUID(), method: "setEditorText", text },
+		{ type: "extension_ui_request", id: crypto.randomUUID(), method: "set_editor_text", text },
+	];
+}
 
 /**
  * Run in RPC mode.
@@ -60,6 +83,10 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 	const error = (id: string | undefined, command: string, message: string): RpcResponse => {
 		return { id, type: "response", command, success: false, error: message };
+	};
+
+	const toErrorMessage = (cause: unknown): string => {
+		return cause instanceof Error ? cause.message : String(cause);
 	};
 
 	// Pending extension UI requests waiting for response
@@ -145,7 +172,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		},
 
 		onTerminalInput(): () => void {
-			// Raw terminal input not supported in RPC mode
+			// Raw terminal input not supported in RPC mode - requires direct TTY access
 			return () => {};
 		},
 
@@ -160,8 +187,14 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			} as RpcExtensionUIRequest);
 		},
 
-		setWorkingMessage(_message?: string): void {
-			// Working message not supported in RPC mode - requires TUI loader access
+		setWorkingMessage(message?: string): void {
+			// Fire and forget - no response needed
+			output({
+				type: "extension_ui_request",
+				id: crypto.randomUUID(),
+				method: "setWorkingMessage",
+				message,
+			} as RpcExtensionUIRequest);
 		},
 
 		setWidget(key: string, content: unknown, options?: ExtensionWidgetOptions): void {
@@ -209,12 +242,9 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 		setEditorText(text: string): void {
 			// Fire and forget - host can implement editor control
-			output({
-				type: "extension_ui_request",
-				id: crypto.randomUUID(),
-				method: "set_editor_text",
-				text,
-			} as RpcExtensionUIRequest);
+			for (const request of createSetEditorTextRequests(text)) {
+				output(request);
+			}
 		},
 
 		getEditorText(): string {
@@ -327,16 +357,24 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			// =================================================================
 
 			case "prompt": {
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
-				session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						source: "rpc",
-					})
-					.catch((e) => output(error(id, "prompt", e.message)));
+				// Fire-and-forget by default, but surface immediate validation failures as command errors.
+				const promptPromise = session.prompt(command.message, {
+					images: command.images,
+					streamingBehavior: command.streamingBehavior,
+					source: "rpc",
+				});
+
+				const promptStart = await settleFireAndForgetStart(promptPromise, toErrorMessage);
+				if (promptStart.status === "rejected") {
+					return error(id, "prompt", promptStart.error);
+				}
+				if (promptStart.status === "pending") {
+					promptPromise.catch((cause: unknown) => {
+						// Background failures occur after acceptance; emit as uncorrelated response envelope.
+						output(error(undefined, "prompt", toErrorMessage(cause)));
+					});
+				}
+
 				return success(id, "prompt");
 			}
 
@@ -351,6 +389,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			}
 
 			case "abort": {
+				session.abortBranchSummary();
 				await session.abort();
 				return success(id, "abort");
 			}
@@ -508,7 +547,15 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			}
 
 			case "get_fork_messages": {
-				const messages = session.getUserMessagesForForking();
+				const raw = session.getUserMessagesForForking();
+				const messages: RpcForkMessage[] = [];
+				for (const msg of raw) {
+					const entry = session.sessionManager.getEntry(msg.entryId);
+					if (!entry) {
+						return error(id, "get_fork_messages", `Entry ${msg.entryId} not found`);
+					}
+					messages.push({ ...msg, timestamp: entry.timestamp });
+				}
 				return success(id, "get_fork_messages", { messages });
 			}
 
@@ -524,6 +571,20 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 				}
 				session.setSessionName(name);
 				return success(id, "set_session_name");
+			}
+
+			// =================================================================
+			// Session Mutation (arbitrary session paths)
+			// =================================================================
+
+			case "rename_session": {
+				renameSessionByPath(command.sessionPath, command.name);
+				return success(id, "rename_session");
+			}
+
+			case "delete_session": {
+				await deleteSessionByPath(command.sessionPath, session.sessionManager.getSessionFile());
+				return success(id, "delete_session");
 			}
 
 			// =================================================================
@@ -576,9 +637,53 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 				return success(id, "get_commands", { commands });
 			}
 
+			// =================================================================
+			// Session listing
+			// =================================================================
+
+			case "list_sessions": {
+				const target = resolveListSessionsTarget(session, command.scope);
+				const raw = target.listAll
+					? await SessionManager.listAll()
+					: await SessionManager.list(target.cwd, target.sessionDir);
+				const sessions: RpcSessionListItem[] = raw.map((sessionInfo) =>
+					toRpcSessionListItem(sessionInfo, command.includeSearchText ?? false),
+				);
+				return success(id, "list_sessions", { sessions });
+			}
+
+			// =================================================================
+			// Tree
+			// =================================================================
+
+			case "get_tree": {
+				const rawTree = session.sessionManager.getTree();
+				const toolCallMap = buildToolCallMap(rawTree);
+				const tree = projectTree(rawTree, toolCallMap, command.includeContent ?? false);
+				const leafId = session.sessionManager.getLeafId();
+				return success(id, "get_tree", { tree, leafId });
+			}
+
+			case "set_label": {
+				// Trim and treat empty/whitespace-only labels as "clear" (consistent with rename_session)
+				const label = command.label?.trim() || undefined;
+				session.sessionManager.appendLabelChange(command.entryId, label);
+				return success(id, "set_label");
+			}
+
+			case "navigate_tree": {
+				const result = await session.navigateTree(command.targetId, {
+					summarize: command.summarize,
+					customInstructions: command.customInstructions,
+					replaceInstructions: command.replaceInstructions,
+					label: command.label,
+				});
+				return success(id, "navigate_tree", toRpcNavigateTreeResult(result));
+			}
+
 			default: {
-				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				const unknownCommand = command as { id?: string; type: string };
+				return error(unknownCommand.id, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
 		}
 	};
@@ -608,30 +713,32 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 	});
 
 	rl.on("line", async (line: string) => {
-		try {
-			const parsed = JSON.parse(line);
+		const parsedInput = parseRpcInputLine(line);
 
-			// Handle extension UI responses
-			if (parsed.type === "extension_ui_response") {
-				const response = parsed as RpcExtensionUIResponse;
-				const pending = pendingExtensionRequests.get(response.id);
-				if (pending) {
-					pendingExtensionRequests.delete(response.id);
-					pending.resolve(response);
-				}
-				return;
+		if (parsedInput.kind === "error") {
+			output(error(parsedInput.error.id, parsedInput.error.command, parsedInput.error.message));
+			return;
+		}
+
+		if (parsedInput.kind === "extension_ui_response") {
+			const pending = pendingExtensionRequests.get(parsedInput.response.id);
+			if (pending) {
+				pendingExtensionRequests.delete(parsedInput.response.id);
+				pending.resolve(parsedInput.response);
 			}
+			return;
+		}
 
-			// Handle regular commands
-			const command = parsed as RpcCommand;
+		const command = parsedInput.command;
+		try {
 			const response = await handleCommand(command);
 			output(response);
-
-			// Check for deferred shutdown request (idle between commands)
-			await checkShutdownRequested();
-		} catch (e: any) {
-			output(error(undefined, "parse", `Failed to parse command: ${e.message}`));
+		} catch (cause: unknown) {
+			output(error(command.id, command.type, toErrorMessage(cause)));
 		}
+
+		// Check for deferred shutdown request (idle between commands)
+		await checkShutdownRequested();
 	});
 
 	// Keep process alive forever

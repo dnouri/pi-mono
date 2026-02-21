@@ -12,9 +12,13 @@ Where `<path>` is the working directory with `/` replaced by `-`.
 
 ## Deleting Sessions
 
-Sessions can be removed by deleting their `.jsonl` files under `~/.pi/agent/sessions/`.
+Session files are ordinary `.jsonl` files under `~/.pi/agent/sessions/`, so manual deletion is possible.
 
-Pi also supports deleting sessions interactively from `/resume` (select a session and press `Ctrl+D`, then confirm). When available, pi uses the `trash` CLI to avoid permanent deletion.
+Prefer built-in deletion paths instead of deleting files directly:
+- **Interactive mode**: `/resume` → select session → `Ctrl+D` (with confirmation)
+- **RPC clients**: [`delete_session`](rpc.md#delete_session)
+
+Both built-in paths apply safety checks (for example, preventing deletion of the active session) and prefer recoverable trash behavior when available.
 
 ## Session Version
 

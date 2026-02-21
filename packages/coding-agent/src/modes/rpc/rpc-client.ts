@@ -11,7 +11,19 @@ import type { ImageContent } from "@mariozechner/pi-ai";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
+import type {
+	RpcCommand,
+	RpcCommandByType,
+	RpcExtensionUIRequest,
+	RpcForkMessage,
+	RpcGetTreeResult,
+	RpcListSessionsResult,
+	RpcNavigateTreeResult,
+	RpcResponse,
+	RpcSessionListItem,
+	RpcSessionState,
+	RpcSlashCommand,
+} from "./rpc-types.js";
 
 // ============================================================================
 // Types
@@ -45,7 +57,68 @@ export interface ModelInfo {
 	reasoning: boolean;
 }
 
+export type RpcPromptOptions = Pick<RpcCommandByType<"prompt">, "images" | "streamingBehavior">;
+
+export type RpcListSessionsOptions = Pick<RpcCommandByType<"list_sessions">, "scope" | "includeSearchText">;
+
 export type RpcEventListener = (event: AgentEvent) => void;
+
+export type RpcProtocolMessage = AgentEvent | RpcResponse | RpcExtensionUIRequest | Record<string, unknown>;
+
+export type RpcProtocolListener = (message: RpcProtocolMessage) => void;
+
+const AGENT_EVENT_TYPES: ReadonlySet<AgentEvent["type"]> = new Set([
+	"agent_start",
+	"agent_end",
+	"turn_start",
+	"turn_end",
+	"message_start",
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+]);
+
+type PromptInput = ImageContent[] | RpcPromptOptions | undefined;
+
+function toPromptOptions(input: PromptInput): RpcPromptOptions {
+	if (!input) {
+		return {};
+	}
+	if (Array.isArray(input)) {
+		return { images: input };
+	}
+	return input;
+}
+
+function toListSessionsOptions(
+	scopeOrOptions?: "current" | "all" | RpcListSessionsOptions,
+	includeSearchText?: boolean,
+): RpcListSessionsOptions {
+	if (!scopeOrOptions || typeof scopeOrOptions === "string") {
+		return {
+			scope: scopeOrOptions,
+			includeSearchText,
+		};
+	}
+	return scopeOrOptions;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAgentEvent(value: unknown): value is AgentEvent {
+	if (!isRecord(value) || typeof value.type !== "string") {
+		return false;
+	}
+	return AGENT_EVENT_TYPES.has(value.type as AgentEvent["type"]);
+}
+
+function isPendingResponseEnvelope(value: unknown): value is RpcResponse & { id: string } {
+	return isRecord(value) && value.type === "response" && typeof value.id === "string";
+}
 
 // ============================================================================
 // RPC Client
@@ -55,6 +128,7 @@ export class RpcClient {
 	private process: ChildProcess | null = null;
 	private rl: readline.Interface | null = null;
 	private eventListeners: RpcEventListener[] = [];
+	private protocolListeners: RpcProtocolListener[] = [];
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	private requestId = 0;
@@ -141,6 +215,7 @@ export class RpcClient {
 
 	/**
 	 * Subscribe to agent events.
+	 * Only AgentEvent envelopes are delivered here.
 	 */
 	onEvent(listener: RpcEventListener): () => void {
 		this.eventListeners.push(listener);
@@ -148,6 +223,21 @@ export class RpcClient {
 			const index = this.eventListeners.indexOf(listener);
 			if (index !== -1) {
 				this.eventListeners.splice(index, 1);
+			}
+		};
+	}
+
+	/**
+	 * Subscribe to all decoded protocol messages that are not correlated responses.
+	 * Includes AgentEvent, RpcResponse (without pending request id), extension UI requests,
+	 * and extension_error envelopes.
+	 */
+	onProtocolMessage(listener: RpcProtocolListener): () => void {
+		this.protocolListeners.push(listener);
+		return () => {
+			const index = this.protocolListeners.indexOf(listener);
+			if (index !== -1) {
+				this.protocolListeners.splice(index, 1);
 			}
 		};
 	}
@@ -167,9 +257,21 @@ export class RpcClient {
 	 * Send a prompt to the agent.
 	 * Returns immediately after sending; use onEvent() to receive streaming events.
 	 * Use waitForIdle() to wait for completion.
+	 *
+	 * Overloads:
+	 * - `prompt(message, images)` (legacy)
+	 * - `prompt(message, { images, streamingBehavior })`
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "prompt", message, images });
+	async prompt(message: string, images?: ImageContent[]): Promise<void>;
+	async prompt(message: string, options?: RpcPromptOptions): Promise<void>;
+	async prompt(message: string, imagesOrOptions?: ImageContent[] | RpcPromptOptions): Promise<void> {
+		const options = toPromptOptions(imagesOrOptions);
+		await this.send({
+			type: "prompt",
+			message,
+			images: options.images,
+			streamingBehavior: options.streamingBehavior,
+		});
 	}
 
 	/**
@@ -348,18 +450,20 @@ export class RpcClient {
 
 	/**
 	 * Get messages available for forking.
+	 * Each message includes its entry ID, text, and timestamp.
 	 */
-	async getForkMessages(): Promise<Array<{ entryId: string; text: string }>> {
+	async getForkMessages(): Promise<RpcForkMessage[]> {
 		const response = await this.send({ type: "get_fork_messages" });
-		return this.getData<{ messages: Array<{ entryId: string; text: string }> }>(response).messages;
+		return this.getData<{ messages: RpcForkMessage[] }>(response).messages;
 	}
 
 	/**
 	 * Get text of last assistant message.
+	 * Returns undefined when no assistant message exists yet.
 	 */
-	async getLastAssistantText(): Promise<string | null> {
+	async getLastAssistantText(): Promise<string | undefined> {
 		const response = await this.send({ type: "get_last_assistant_text" });
-		return this.getData<{ text: string | null }>(response).text;
+		return this.getData<{ text?: string }>(response).text;
 	}
 
 	/**
@@ -370,11 +474,84 @@ export class RpcClient {
 	}
 
 	/**
+	 * Rename any session by its file path.
+	 */
+	async renameSession(sessionPath: string, name: string): Promise<void> {
+		await this.send({ type: "rename_session", sessionPath, name });
+	}
+
+	/**
+	 * Delete any session by its file path.
+	 */
+	async deleteSession(sessionPath: string): Promise<void> {
+		await this.send({ type: "delete_session", sessionPath });
+	}
+
+	/**
 	 * Get all messages in the session.
 	 */
 	async getMessages(): Promise<AgentMessage[]> {
 		const response = await this.send({ type: "get_messages" });
 		return this.getData<{ messages: AgentMessage[] }>(response).messages;
+	}
+
+	/**
+	 * Get the session tree with lightweight projected nodes.
+	 * @param includeContent When true, includes full text content alongside preview.
+	 */
+	async getTree(includeContent?: boolean): Promise<RpcGetTreeResult> {
+		const response = await this.send({ type: "get_tree", includeContent });
+		return this.getData(response);
+	}
+
+	/**
+	 * Set or clear a label on a tree entry.
+	 * @param entryId Entry to label.
+	 * @param label Label text, or omit/empty to clear.
+	 */
+	async setLabel(entryId: string, label?: string): Promise<void> {
+		await this.send({ type: "set_label", entryId, label });
+	}
+
+	/**
+	 * Navigate to a different point in the session tree.
+	 * @param targetId Entry ID to navigate to.
+	 * @param options Navigation options (summarize, customInstructions, replaceInstructions, label).
+	 */
+	async navigateTree(
+		targetId: string,
+		options?: Omit<Extract<RpcCommand, { type: "navigate_tree" }>, "id" | "type" | "targetId">,
+	): Promise<RpcNavigateTreeResult> {
+		const response = await this.send({
+			type: "navigate_tree",
+			targetId,
+			...options,
+		});
+		return this.getData(response);
+	}
+
+	/**
+	 * List sessions for the current project or all projects.
+	 * @param scope "current" (default) lists the active project's sessions; "all" lists cross-project.
+	 * @param includeSearchText When true, includes allMessagesText for client-side search.
+	 *
+	 * Overloads:
+	 * - `listSessions(scope?, includeSearchText?)` (legacy)
+	 * - `listSessions({ scope, includeSearchText })`
+	 */
+	async listSessions(scope?: "current" | "all", includeSearchText?: boolean): Promise<RpcSessionListItem[]>;
+	async listSessions(options?: RpcListSessionsOptions): Promise<RpcSessionListItem[]>;
+	async listSessions(
+		scopeOrOptions?: "current" | "all" | RpcListSessionsOptions,
+		includeSearchText?: boolean,
+	): Promise<RpcSessionListItem[]> {
+		const options = toListSessionsOptions(scopeOrOptions, includeSearchText);
+		const response = await this.send({
+			type: "list_sessions",
+			scope: options.scope,
+			includeSearchText: options.includeSearchText,
+		});
+		return this.getData<RpcListSessionsResult>(response).sessions;
 	}
 
 	/**
@@ -435,10 +612,28 @@ export class RpcClient {
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
-	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
+	async promptAndWait(message: string, images?: ImageContent[], timeout?: number): Promise<AgentEvent[]>;
+	async promptAndWait(message: string, options?: RpcPromptOptions, timeout?: number): Promise<AgentEvent[]>;
+	async promptAndWait(
+		message: string,
+		imagesOrOptions?: ImageContent[] | RpcPromptOptions,
+		timeout = 60000,
+	): Promise<AgentEvent[]> {
 		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
+		await this.prompt(message, toPromptOptions(imagesOrOptions));
 		return eventsPromise;
+	}
+
+	/**
+	 * Write a raw JSON string to the process stdin.
+	 * Bypasses typed command validation — use for testing edge cases
+	 * like unknown commands that cannot be expressed via the typed API.
+	 */
+	sendRaw(json: string): void {
+		if (!this.process?.stdin) {
+			throw new Error("Client not started");
+		}
+		this.process.stdin.write(`${json.replace(/\n+$/, "")}\n`);
 	}
 
 	// =========================================================================
@@ -447,19 +642,28 @@ export class RpcClient {
 
 	private handleLine(line: string): void {
 		try {
-			const data = JSON.parse(line);
-
-			// Check if it's a response to a pending request
-			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
-				const pending = this.pendingRequests.get(data.id)!;
-				this.pendingRequests.delete(data.id);
-				pending.resolve(data as RpcResponse);
+			const data = JSON.parse(line) as unknown;
+			if (!isRecord(data)) {
 				return;
 			}
 
-			// Otherwise it's an event
+			// Correlated response to a pending request
+			if (isPendingResponseEnvelope(data) && this.pendingRequests.has(data.id)) {
+				const pending = this.pendingRequests.get(data.id)!;
+				pending.resolve(data);
+				return;
+			}
+
+			for (const listener of this.protocolListeners) {
+				listener(data as RpcProtocolMessage);
+			}
+
+			if (!isAgentEvent(data)) {
+				return;
+			}
+
 			for (const listener of this.eventListeners) {
-				listener(data as AgentEvent);
+				listener(data);
 			}
 		} catch {
 			// Ignore non-JSON lines
@@ -473,27 +677,61 @@ export class RpcClient {
 
 		const id = `req_${++this.requestId}`;
 		const fullCommand = { ...command, id } as RpcCommand;
+		const rpcProcess = this.process;
 
 		return new Promise((resolve, reject) => {
-			this.pendingRequests.set(id, { resolve, reject });
+			let settled = false;
+
+			const cleanup = () => {
+				clearTimeout(timeout);
+				rpcProcess.off("exit", onExit);
+				rpcProcess.off("error", onProcessError);
+			};
+
+			const finishResolve = (response: RpcResponse) => {
+				if (settled) return;
+				settled = true;
+				this.pendingRequests.delete(id);
+				cleanup();
+				resolve(response);
+			};
+
+			const finishReject = (error: Error) => {
+				if (settled) return;
+				settled = true;
+				this.pendingRequests.delete(id);
+				cleanup();
+				reject(error);
+			};
+
+			const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+				const reason = code !== null ? `code ${code}` : `signal ${signal ?? "unknown"}`;
+				finishReject(
+					new Error(`Agent process exited (${reason}) before response to ${command.type}. Stderr: ${this.stderr}`),
+				);
+			};
+
+			const onProcessError = (error: Error) => {
+				finishReject(
+					new Error(
+						`Agent process errored before response to ${command.type}: ${error.message}. Stderr: ${this.stderr}`,
+					),
+				);
+			};
 
 			const timeout = setTimeout(() => {
-				this.pendingRequests.delete(id);
-				reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
+				finishReject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
 			}, 30000);
 
+			rpcProcess.on("exit", onExit);
+			rpcProcess.on("error", onProcessError);
+
 			this.pendingRequests.set(id, {
-				resolve: (response) => {
-					clearTimeout(timeout);
-					resolve(response);
-				},
-				reject: (error) => {
-					clearTimeout(timeout);
-					reject(error);
-				},
+				resolve: finishResolve,
+				reject: finishReject,
 			});
 
-			this.process!.stdin!.write(`${JSON.stringify(fullCommand)}\n`);
+			rpcProcess.stdin!.write(`${JSON.stringify(fullCommand)}\n`);
 		});
 	}
 

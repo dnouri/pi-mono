@@ -450,6 +450,7 @@ async function main() {
 				break;
 			}
 
+			case "setEditorText":
 			case "set_editor_text":
 				promptInput.input.setValue((req.text as string) ?? "");
 				tui.requestRender();
