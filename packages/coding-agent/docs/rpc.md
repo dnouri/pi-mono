@@ -24,6 +24,32 @@ Common options:
 
 All commands support an optional `id` field for request/response correlation. If provided, the corresponding response will include the same `id`.
 
+### `RpcClient.onEvent` listener behavior
+
+`RpcClient.onEvent(...)` receives **all decoded non-correlated envelopes** from stdout, not only `AgentEvent` payloads. The listener payload type is `RpcEventEnvelope`, which includes:
+
+- Agent/session events (for example `message_update`, `agent_end`, `auto_retry_start`)
+- Extension UI requests (`extension_ui_request`)
+- Extension errors (`extension_error`)
+- Non-correlated protocol responses (for example parse/error envelopes without a matching pending request)
+
+The client API keeps a single listener surface (`onEvent`) for this stream. For AgentEvent-only handling, use `isRpcAgentEvent(...)`:
+
+```ts
+const client = new RpcClient();
+client.onEvent((envelope) => {
+  if (!isRpcAgentEvent(envelope)) {
+    return;
+  }
+
+  if (envelope.type === "message_update") {
+    // envelope is narrowed to AgentEvent here
+  }
+});
+```
+
+Migration note: if your callback parameter was explicitly annotated as `AgentEvent` (for example `client.onEvent((event: AgentEvent) => ...)`), switch to `RpcEventEnvelope` or remove the explicit annotation and narrow with `isRpcAgentEvent(...)`.
+
 ## Commands
 
 ### Prompting
@@ -625,7 +651,7 @@ Response:
 }
 ```
 
-Returns `{"text": null}` if no assistant messages exist.
+The `text` field is always present. Returns `{"text": null}` if no assistant messages exist.
 
 #### set_session_name
 
@@ -645,6 +671,44 @@ Response:
 ```
 
 The current session name is available via `get_state` in the `sessionName` field.
+
+#### rename_session
+
+Set the display name for a session file by path.
+
+```json
+{"type": "rename_session", "sessionPath": "./sessions/2026-02-22_my-session.jsonl", "name": "my-feature-work"}
+```
+
+Response:
+```json
+{"type": "response", "command": "rename_session", "success": true}
+```
+
+Contract:
+- `sessionPath` may be absolute or relative (relative paths resolve from the RPC process working directory).
+- Target must be an existing `.jsonl` file with a valid session header (`{"type":"session","id":"..."}`).
+- `name` is trimmed; empty names are rejected.
+
+#### delete_session
+
+Delete a session file by path.
+
+```json
+{"type": "delete_session", "sessionPath": "./sessions/2026-02-22_my-session.jsonl"}
+```
+
+Response:
+```json
+{"type": "response", "command": "delete_session", "success": true}
+```
+
+Contract:
+- `sessionPath` may be absolute or relative (relative paths resolve from the RPC process working directory).
+- Target must be an existing `.jsonl` file with a valid session header (`{"type":"session","id":"..."}`).
+- Deleting the currently active session is rejected.
+
+Limitation: the active-session delete guard is process-local. It does not detect whether another `pi` process has the same session file open.
 
 ### Commands
 

@@ -11,7 +11,11 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 
+import { spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { unlink } from "node:fs/promises";
+import { extname, resolve } from "node:path";
 import * as readline from "readline";
 import type { AgentSession } from "../../core/agent-session.js";
 import type {
@@ -19,11 +23,13 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
+import { loadEntriesFromFile, SessionManager } from "../../core/session-manager.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcProtocolEnvelope,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -43,7 +49,7 @@ export type {
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(session: AgentSession): Promise<never> {
-	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+	const output = (obj: RpcProtocolEnvelope) => {
 		console.log(JSON.stringify(obj));
 	};
 
@@ -60,6 +66,73 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 	const error = (id: string | undefined, command: string, message: string): RpcResponse => {
 		return { id, type: "response", command, success: false, error: message };
+	};
+
+	const toErrorMessage = (cause: unknown): string => {
+		return cause instanceof Error ? cause.message : String(cause);
+	};
+
+	const normalizePathForComparison = (path: string): string => {
+		try {
+			return realpathSync(path);
+		} catch {
+			return resolve(path);
+		}
+	};
+
+	const isSameSessionPath = (pathA: string, pathB: string | undefined): boolean => {
+		if (!pathB) {
+			return false;
+		}
+		return normalizePathForComparison(pathA) === normalizePathForComparison(pathB);
+	};
+
+	const requireValidSessionFile = (sessionPath: string): string => {
+		const resolvedPath = resolve(sessionPath);
+		if (extname(resolvedPath).toLowerCase() !== ".jsonl") {
+			throw new Error(`Session file must use .jsonl extension: ${sessionPath}`);
+		}
+
+		let isFile = false;
+		try {
+			isFile = statSync(resolvedPath).isFile();
+		} catch {
+			isFile = false;
+		}
+
+		if (!isFile) {
+			throw new Error(`Session file not found: ${sessionPath}`);
+		}
+
+		if (loadEntriesFromFile(resolvedPath).length === 0) {
+			throw new Error(`Session file is not a valid pi session: ${sessionPath}`);
+		}
+
+		return resolvedPath;
+	};
+
+	const deleteSessionFile = async (sessionPath: string): Promise<void> => {
+		const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
+		const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+		if (trashResult.status === 0 || !existsSync(sessionPath)) {
+			return;
+		}
+
+		try {
+			await unlink(sessionPath);
+		} catch (cause: unknown) {
+			const unlinkError = toErrorMessage(cause);
+			const parts: string[] = [];
+			if (trashResult.error) {
+				parts.push(trashResult.error.message);
+			}
+			const stderr = trashResult.stderr?.trim();
+			if (stderr) {
+				parts.push(stderr.split("\n")[0] ?? stderr);
+			}
+			const trashHint = parts.length > 0 ? ` (trash: ${parts.join(" · ").slice(0, 200)})` : "";
+			throw new Error(`${unlinkError}${trashHint}`);
+		}
 	};
 
 	// Pending extension UI requests waiting for response
@@ -514,7 +587,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 			case "get_last_assistant_text": {
 				const text = session.getLastAssistantText();
-				return success(id, "get_last_assistant_text", { text });
+				return success(id, "get_last_assistant_text", { text: text ?? null });
 			}
 
 			case "set_session_name": {
@@ -524,6 +597,42 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 				}
 				session.setSessionName(name);
 				return success(id, "set_session_name");
+			}
+
+			case "rename_session": {
+				try {
+					const name = command.name.trim();
+					if (!name) {
+						return error(id, "rename_session", "Session name cannot be empty");
+					}
+
+					const targetPath = requireValidSessionFile(command.sessionPath);
+					const activeSessionPath = session.sessionManager.getSessionFile();
+					if (isSameSessionPath(targetPath, activeSessionPath)) {
+						session.setSessionName(name);
+					} else {
+						const manager = SessionManager.open(targetPath);
+						manager.appendSessionInfo(name);
+					}
+					return success(id, "rename_session");
+				} catch (cause: unknown) {
+					return error(id, "rename_session", toErrorMessage(cause));
+				}
+			}
+
+			case "delete_session": {
+				try {
+					const targetPath = requireValidSessionFile(command.sessionPath);
+					const activeSessionPath = session.sessionManager.getSessionFile();
+					if (isSameSessionPath(targetPath, activeSessionPath)) {
+						return error(id, "delete_session", "Cannot delete the currently active session");
+					}
+
+					await deleteSessionFile(targetPath);
+					return success(id, "delete_session");
+				} catch (cause: unknown) {
+					return error(id, "delete_session", toErrorMessage(cause));
+				}
 			}
 
 			// =================================================================
@@ -578,7 +687,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 			default: {
 				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				return error(id, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
 		}
 	};
