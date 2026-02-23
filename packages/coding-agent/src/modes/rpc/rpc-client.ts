@@ -11,7 +11,7 @@ import type { ImageContent } from "@mariozechner/pi-ai";
 import type { SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
+import type { RpcCommand, RpcProtocolEnvelope, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
 
 // ============================================================================
 // Types
@@ -45,7 +45,33 @@ export interface ModelInfo {
 	reasoning: boolean;
 }
 
-export type RpcEventListener = (event: AgentEvent) => void;
+export type RpcEventEnvelope = RpcProtocolEnvelope;
+export type RpcEventListener = (event: RpcEventEnvelope) => void;
+
+const AGENT_EVENT_TYPES: ReadonlySet<AgentEvent["type"]> = new Set([
+	"agent_start",
+	"agent_end",
+	"turn_start",
+	"turn_end",
+	"message_start",
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function isRpcAgentEvent(value: unknown): value is AgentEvent {
+	if (!isRecord(value)) {
+		return false;
+	}
+	const maybeType = value.type;
+	return typeof maybeType === "string" && AGENT_EVENT_TYPES.has(maybeType as AgentEvent["type"]);
+}
 
 // ============================================================================
 // RPC Client
@@ -140,7 +166,11 @@ export class RpcClient {
 	}
 
 	/**
-	 * Subscribe to agent events.
+	 * Subscribe to non-correlated stdout envelopes.
+	 *
+	 * Compatibility note: runtime currently forwards all decoded non-correlated
+	 * protocol envelopes here (AgentEvent plus extension/protocol envelopes).
+	 * Use `isRpcAgentEvent()` to narrow envelopes to AgentEvent-only handling.
 	 */
 	onEvent(listener: RpcEventListener): () => void {
 		this.eventListeners.push(listener);
@@ -370,6 +400,26 @@ export class RpcClient {
 	}
 
 	/**
+	 * Set the display name of a session file.
+	 *
+	 * The target must be an existing valid `.jsonl` session file.
+	 * Relative paths are resolved from the RPC process working directory.
+	 */
+	async renameSession(sessionPath: string, name: string): Promise<void> {
+		await this.send({ type: "rename_session", sessionPath, name });
+	}
+
+	/**
+	 * Delete a session file.
+	 *
+	 * The target must be an existing valid `.jsonl` session file.
+	 * Relative paths are resolved from the RPC process working directory.
+	 */
+	async deleteSession(sessionPath: string): Promise<void> {
+		await this.send({ type: "delete_session", sessionPath });
+	}
+
+	/**
 	 * Get all messages in the session.
 	 */
 	async getMessages(): Promise<AgentMessage[]> {
@@ -401,6 +451,9 @@ export class RpcClient {
 			}, timeout);
 
 			const unsubscribe = this.onEvent((event) => {
+				if (!isRpcAgentEvent(event)) {
+					return;
+				}
 				if (event.type === "agent_end") {
 					clearTimeout(timer);
 					unsubscribe();
@@ -422,6 +475,9 @@ export class RpcClient {
 			}, timeout);
 
 			const unsubscribe = this.onEvent((event) => {
+				if (!isRpcAgentEvent(event)) {
+					return;
+				}
 				events.push(event);
 				if (event.type === "agent_end") {
 					clearTimeout(timer);
@@ -447,19 +503,22 @@ export class RpcClient {
 
 	private handleLine(line: string): void {
 		try {
-			const data = JSON.parse(line);
+			const data = JSON.parse(line) as unknown;
+			if (!isRecord(data) || typeof data.type !== "string") {
+				return;
+			}
 
 			// Check if it's a response to a pending request
-			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
+			if (data.type === "response" && typeof data.id === "string" && this.pendingRequests.has(data.id)) {
 				const pending = this.pendingRequests.get(data.id)!;
 				this.pendingRequests.delete(data.id);
 				pending.resolve(data as RpcResponse);
 				return;
 			}
 
-			// Otherwise it's an event
+			// Otherwise it's an event/protocol envelope
 			for (const listener of this.eventListeners) {
-				listener(data as AgentEvent);
+				listener(data as RpcEventEnvelope);
 			}
 		} catch {
 			// Ignore non-JSON lines

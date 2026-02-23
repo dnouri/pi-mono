@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { RpcClient } from "../src/modes/rpc/rpc-client.js";
+import { isRpcAgentEvent, RpcClient } from "../src/modes/rpc/rpc-client.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -18,21 +18,26 @@ async function main() {
 		args: ["--no-session"],
 	});
 
-	// Stream events to console
-	client.onEvent((event) => {
-		if (event.type === "message_update") {
-			const { assistantMessageEvent } = event;
+	// Stream events to console.
+	// RpcClient.onEvent includes non-Agent protocol envelopes, so narrow first.
+	client.onEvent((envelope) => {
+		if (!isRpcAgentEvent(envelope)) {
+			return;
+		}
+
+		if (envelope.type === "message_update") {
+			const { assistantMessageEvent } = envelope;
 			if (assistantMessageEvent.type === "text_delta" || assistantMessageEvent.type === "thinking_delta") {
 				process.stdout.write(assistantMessageEvent.delta);
 			}
 		}
 
-		if (event.type === "tool_execution_start") {
-			console.log(`\n[Tool: ${event.toolName}]`);
+		if (envelope.type === "tool_execution_start") {
+			console.log(`\n[Tool: ${envelope.toolName}]`);
 		}
 
-		if (event.type === "tool_execution_end") {
-			console.log(`[Result: ${JSON.stringify(event.result).slice(0, 200)}...]\n`);
+		if (envelope.type === "tool_execution_end") {
+			console.log(`[Result: ${JSON.stringify(envelope.result).slice(0, 200)}...]\n`);
 		}
 	});
 

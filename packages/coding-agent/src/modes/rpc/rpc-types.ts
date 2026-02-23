@@ -7,7 +7,7 @@
 
 import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
-import type { SessionStats } from "../../core/agent-session.js";
+import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 
@@ -59,6 +59,8 @@ export type RpcCommand =
 	| { id?: string; type: "get_fork_messages" }
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
+	| { id?: string; type: "rename_session"; sessionPath: string; name: string }
+	| { id?: string; type: "delete_session"; sessionPath: string }
 
 	// Messages
 	| { id?: string; type: "get_messages" }
@@ -188,6 +190,8 @@ export type RpcResponse =
 			data: { text: string | null };
 	  }
 	| { id?: string; type: "response"; command: "set_session_name"; success: true }
+	| { id?: string; type: "response"; command: "rename_session"; success: true }
+	| { id?: string; type: "response"; command: "delete_session"; success: true }
 
 	// Messages
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
@@ -246,6 +250,14 @@ export type RpcExtensionUIRequest =
 	| { type: "extension_ui_request"; id: string; method: "setTitle"; title: string }
 	| { type: "extension_ui_request"; id: string; method: "set_editor_text"; text: string };
 
+/** Emitted when an extension handler throws */
+export interface RpcExtensionErrorEvent {
+	type: "extension_error";
+	extensionPath: string;
+	event: string;
+	error: string;
+}
+
 // ============================================================================
 // Extension UI Commands (stdin)
 // ============================================================================
@@ -255,6 +267,12 @@ export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
 	| { type: "extension_ui_response"; id: string; cancelled: true };
+
+/**
+ * Decoded stdout envelopes emitted by RPC mode and delivered to RpcClient.onEvent().
+ * Correlated responses (matching a pending request id) are handled internally by RpcClient and not forwarded.
+ */
+export type RpcProtocolEnvelope = AgentSessionEvent | RpcExtensionUIRequest | RpcExtensionErrorEvent | RpcResponse;
 
 // ============================================================================
 // Helper type for extracting command types
