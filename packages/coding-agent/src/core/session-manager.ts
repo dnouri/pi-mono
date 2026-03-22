@@ -705,6 +705,9 @@ export class SessionManager {
 
 			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
 			this.sessionId = header?.id ?? randomUUID();
+			if (header?.cwd) {
+				this.cwd = header.cwd;
+			}
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
 				this._rewriteFile();

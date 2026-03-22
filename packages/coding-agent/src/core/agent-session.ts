@@ -295,7 +295,8 @@ export class AgentSession {
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
-		this._cwd = config.cwd;
+		this._cwd = config.sessionManager.getCwd() || config.cwd;
+		this._syncProcessCwd();
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -2276,6 +2277,28 @@ export class AgentSession {
 		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
 	}
 
+	private _syncProcessCwd(): void {
+		if (!this._cwd || process.cwd() === this._cwd) {
+			return;
+		}
+
+		try {
+			process.chdir(this._cwd);
+		} catch {
+			// Keep internal cwd authoritative even if the recorded directory no longer exists.
+		}
+	}
+
+	private _syncRuntimeCwd(): void {
+		this._cwd = this.sessionManager.getCwd() || this._cwd;
+		this._syncProcessCwd();
+		this._buildRuntime({
+			activeToolNames: this.getActiveToolNames(),
+			flagValues: this._extensionRunner?.getFlagValues(),
+			includeAllExtensionTools: true,
+		});
+	}
+
 	private _buildRuntime(options: {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
@@ -2522,7 +2545,7 @@ export class AgentSession {
 
 		try {
 			const result = options?.operations
-				? await executeBashWithOperations(resolvedCommand, process.cwd(), options.operations, {
+				? await executeBashWithOperations(resolvedCommand, this._cwd, options.operations, {
 						onChunk,
 						signal: this._bashAbortController.signal,
 					})
@@ -2637,6 +2660,7 @@ export class AgentSession {
 
 		// Set new session
 		this.sessionManager.setSessionFile(sessionPath);
+		this._syncRuntimeCwd();
 		this.agent.sessionId = this.sessionManager.getSessionId();
 
 		// Reload messages
