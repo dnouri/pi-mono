@@ -18,9 +18,13 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
+
+import { SessionManager } from "../../core/session-manager.js";
 import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
+import { normalizeRpcLabel, toRpcNavigateTreeResult, toRpcSessionListItem } from "./rpc-command-wiring.js";
+import { buildToolCallMap, projectTree, resolveProjectedLeafId } from "./rpc-tree-projection.js";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -35,8 +39,11 @@ export type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcNavigateTreeResult,
 	RpcResponse,
+	RpcSessionListItem,
 	RpcSessionState,
+	RpcTreeNode,
 } from "./rpc-types.js";
 
 /**
@@ -529,6 +536,15 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 				return success(id, "set_session_name");
 			}
 
+			case "list_sessions": {
+				const cwd = session.sessionManager.getCwd();
+				const sessionDir = session.sessionManager.getSessionDir().trim() || undefined;
+				const raw =
+					command.scope === "all" ? await SessionManager.listAll() : await SessionManager.list(cwd, sessionDir);
+				const sessions = raw.map(toRpcSessionListItem);
+				return success(id, "list_sessions", { sessions });
+			}
+
 			// =================================================================
 			// Messages
 			// =================================================================
@@ -544,39 +560,74 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			case "get_commands": {
 				const commands: RpcSlashCommand[] = [];
 
-				// Extension commands
-				for (const { command, extensionPath } of session.extensionRunner?.getRegisteredCommandsWithPaths() ?? []) {
+				for (const command of session.extensionRunner?.getRegisteredCommands() ?? []) {
 					commands.push({
-						name: command.name,
+						name: command.invocationName,
 						description: command.description,
 						source: "extension",
-						path: extensionPath,
+						sourceInfo: command.sourceInfo,
 					});
 				}
 
-				// Prompt templates (source is always "user" | "project" | "path" in coding-agent)
 				for (const template of session.promptTemplates) {
 					commands.push({
 						name: template.name,
 						description: template.description,
 						source: "prompt",
-						location: template.source as RpcSlashCommand["location"],
-						path: template.filePath,
+						sourceInfo: template.sourceInfo,
 					});
 				}
 
-				// Skills (source is always "user" | "project" | "path" in coding-agent)
 				for (const skill of session.resourceLoader.getSkills().skills) {
 					commands.push({
 						name: `skill:${skill.name}`,
 						description: skill.description,
 						source: "skill",
-						location: skill.source as RpcSlashCommand["location"],
-						path: skill.filePath,
+						sourceInfo: skill.sourceInfo,
 					});
 				}
 
 				return success(id, "get_commands", { commands });
+			}
+
+			// =================================================================
+			// Tree
+			// =================================================================
+
+			case "abort_branch_summary": {
+				session.abortBranchSummary();
+				return success(id, "abort_branch_summary");
+			}
+
+			case "get_tree": {
+				const rawTree = session.sessionManager.getTree();
+				const toolCallMap = buildToolCallMap(rawTree);
+				const tree = projectTree(rawTree, toolCallMap);
+				const leafId = resolveProjectedLeafId(rawTree, session.sessionManager.getLeafId());
+				return success(id, "get_tree", { tree, leafId });
+			}
+
+			case "navigate_tree": {
+				try {
+					const result = await session.navigateTree(command.targetId, {
+						summarize: command.summarize,
+						customInstructions: command.customInstructions,
+						replaceInstructions: command.replaceInstructions,
+						label: normalizeRpcLabel(command.label),
+					});
+					return success(id, "navigate_tree", toRpcNavigateTreeResult(result));
+				} catch (e: any) {
+					return error(id, "navigate_tree", e.message);
+				}
+			}
+
+			case "set_label": {
+				try {
+					session.sessionManager.appendLabelChange(command.entryId, normalizeRpcLabel(command.label));
+				} catch (e: any) {
+					return error(id, "set_label", e.message);
+				}
+				return success(id, "set_label");
 			}
 
 			default: {
