@@ -18,7 +18,9 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
+
 import { SessionManager } from "../../core/session-manager.js";
+import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
 import { normalizeRpcLabel, toRpcNavigateTreeResult, toRpcSessionListItem } from "./rpc-command-wiring.js";
@@ -49,8 +51,10 @@ export type {
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(session: AgentSession): Promise<never> {
+	takeOverStdout();
+
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(serializeJsonLine(obj));
+		writeRawStdout(serializeJsonLine(obj));
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -556,35 +560,30 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			case "get_commands": {
 				const commands: RpcSlashCommand[] = [];
 
-				// Extension commands
-				for (const { command, extensionPath } of session.extensionRunner?.getRegisteredCommandsWithPaths() ?? []) {
+				for (const command of session.extensionRunner?.getRegisteredCommands() ?? []) {
 					commands.push({
-						name: command.name,
+						name: command.invocationName,
 						description: command.description,
 						source: "extension",
-						path: extensionPath,
+						sourceInfo: command.sourceInfo,
 					});
 				}
 
-				// Prompt templates (source is always "user" | "project" | "path" in coding-agent)
 				for (const template of session.promptTemplates) {
 					commands.push({
 						name: template.name,
 						description: template.description,
 						source: "prompt",
-						location: template.source as RpcSlashCommand["location"],
-						path: template.filePath,
+						sourceInfo: template.sourceInfo,
 					});
 				}
 
-				// Skills (source is always "user" | "project" | "path" in coding-agent)
 				for (const skill of session.resourceLoader.getSkills().skills) {
 					commands.push({
 						name: `skill:${skill.name}`,
 						description: skill.description,
 						source: "skill",
-						location: skill.source as RpcSlashCommand["location"],
-						path: skill.filePath,
+						sourceInfo: skill.sourceInfo,
 					});
 				}
 
@@ -644,9 +643,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 	 */
 	let detachInput = () => {};
 
-	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested) return;
-
+	async function shutdown(): Promise<never> {
 		const currentRunner = session.extensionRunner;
 		if (currentRunner?.hasHandlers("session_shutdown")) {
 			await currentRunner.emit({ type: "session_shutdown" });
@@ -655,6 +652,11 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		detachInput();
 		process.stdin.pause();
 		process.exit(0);
+	}
+
+	async function checkShutdownRequested(): Promise<void> {
+		if (!shutdownRequested) return;
+		await shutdown();
 	}
 
 	const handleInputLine = async (line: string) => {
@@ -684,9 +686,20 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		}
 	};
 
-	detachInput = attachJsonlLineReader(process.stdin, (line) => {
-		void handleInputLine(line);
-	});
+	const onInputEnd = () => {
+		void shutdown();
+	};
+	process.stdin.on("end", onInputEnd);
+
+	detachInput = (() => {
+		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
+			void handleInputLine(line);
+		});
+		return () => {
+			detachJsonl();
+			process.stdin.off("end", onInputEnd);
+		};
+	})();
 
 	// Keep process alive forever
 	return new Promise(() => {});

@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-03-23
+
+## [0.61.1] - 2026-03-20
+
+## [0.61.0] - 2026-03-20
+
+## [0.60.0] - 2026-03-18
+
+## [0.59.0] - 2026-03-17
+
+### Added
+
+- Exported `CustomProviderDialog` from `@mariozechner/pi-web-ui` ([#2267](https://github.com/badlogic/pi-mono/issues/2267))
+
+## [0.58.4] - 2026-03-16
+
 ### Added
 
 - `onModelSelect` callback on `AgentInterface` and `ChatPanel.setAgent` config
